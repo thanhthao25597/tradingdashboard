@@ -361,11 +361,17 @@ def fetch_yahoo_prices(tickers, start_date, end_date):
             close_col = "Close"
             if isinstance(hist.columns, pd.MultiIndex):
                 hist.columns = [c[0] if isinstance(c, tuple) else c for c in hist.columns]
-            out = hist[["Date", close_col]].rename(columns={"Date": "date", close_col: "close"})
+            cols = ["Date", close_col]
+            if "Volume" in hist.columns:
+                cols.append("Volume")
+            out = hist[cols].rename(columns={"Date": "date", close_col: "close", "Volume": "volume"})
             out["ticker"] = ticker
             out["date"] = pd.to_datetime(out["date"]).dt.tz_localize(None)
             out["close"] = pd.to_numeric(out["close"], errors="coerce")
-            frames.append(out[["date", "ticker", "close"]].dropna())
+            if "volume" in out.columns:
+                out["volume"] = pd.to_numeric(out["volume"], errors="coerce")
+            keep_cols = ["date", "ticker", "close"] + (["volume"] if "volume" in out.columns else [])
+            frames.append(out[keep_cols].dropna(subset=["date", "ticker", "close"]))
         except Exception:
             continue
 
@@ -386,6 +392,8 @@ def normalize_price_history(df):
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    if "volume" in df.columns:
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
     return df.dropna(subset=["date", "ticker", "close"]).sort_values(["ticker", "date"])
 
 
@@ -430,8 +438,14 @@ def latest_price_snapshot(prices):
     p["price_vs_ma20"] = p["close"] / p["ma20"] - 1
     p["price_vs_ma60"] = p["close"] / p["ma60"] - 1
     p["price_vs_ma200"] = p["close"] / p["ma200"] - 1
+    if "volume" in p.columns:
+        p["volume_ma20"] = p.groupby("ticker")["volume"].transform(lambda s: s.rolling(20, min_periods=5).mean())
+        p["volume_vs_ma20"] = p["volume"] / p["volume_ma20"]
     snap = p.groupby("ticker", as_index=False).tail(1)
-    return snap[["ticker", "date", "close", "ma20", "ma60", "ma200", "return_20d", "return_60d", "price_vs_ma20", "price_vs_ma60", "price_vs_ma200"]]
+    cols = ["ticker", "date", "close", "ma20", "ma60", "ma200", "return_20d", "return_60d", "price_vs_ma20", "price_vs_ma60", "price_vs_ma200"]
+    if "volume" in snap.columns:
+        cols += ["volume", "volume_ma20", "volume_vs_ma20"]
+    return snap[cols]
 
 
 def build_watchlist_view(watchlist, prices):
@@ -527,6 +541,209 @@ def build_missed_opportunity_view(watchlist, prices):
         for c in ["sector", "industry", "cycle", "reason_not_bought", "watch_reason", "note"]:
             if c in watchlist.columns:
                 out[c] = row.get(c)
+        rows.append(out)
+
+    return pd.DataFrame(rows)
+
+
+# =========================================================
+# Auto setup / regime classification
+# =========================================================
+
+def build_price_indicators(prices):
+    """Create technical context used to auto-classify each BUY decision.
+
+    The logic is intentionally transparent and rule-based, not a black-box score.
+    It uses only price/volume history available in the dashboard.
+    """
+    if prices is None or prices.empty:
+        return pd.DataFrame()
+
+    p = prices.sort_values(["ticker", "date"]).copy()
+    g = p.groupby("ticker", group_keys=False)
+    p["ma20"] = g["close"].transform(lambda s: s.rolling(20, min_periods=5).mean())
+    p["ma60"] = g["close"].transform(lambda s: s.rolling(60, min_periods=20).mean())
+    p["ma200"] = g["close"].transform(lambda s: s.rolling(200, min_periods=60).mean())
+    p["high20"] = g["close"].transform(lambda s: s.rolling(20, min_periods=5).max())
+    p["low20"] = g["close"].transform(lambda s: s.rolling(20, min_periods=5).min())
+    p["high60"] = g["close"].transform(lambda s: s.rolling(60, min_periods=20).max())
+    p["low60"] = g["close"].transform(lambda s: s.rolling(60, min_periods=20).min())
+    p["return_5d"] = g["close"].pct_change(5)
+    p["return_20d"] = g["close"].pct_change(20)
+    p["return_60d"] = g["close"].pct_change(60)
+    p["price_vs_ma20"] = p["close"] / p["ma20"] - 1
+    p["price_vs_ma60"] = p["close"] / p["ma60"] - 1
+    p["price_vs_ma200"] = p["close"] / p["ma200"] - 1
+    p["distance_to_high20"] = p["close"] / p["high20"] - 1
+    p["distance_to_low20"] = p["close"] / p["low20"] - 1
+
+    if "volume" in p.columns:
+        p["volume_ma20"] = g["volume"].transform(lambda s: s.rolling(20, min_periods=5).mean())
+        p["volume_vs_ma20"] = p["volume"] / p["volume_ma20"]
+
+    return p
+
+
+def _classify_market_regime(row):
+    close = row.get("close")
+    ma20 = row.get("ma20")
+    ma60 = row.get("ma60")
+    ma200 = row.get("ma200")
+    ret20 = row.get("return_20d")
+
+    if pd.isna(close) or pd.isna(ma20) or pd.isna(ma60):
+        return "Insufficient data"
+
+    above200 = True if pd.isna(ma200) else close >= ma200
+    below200 = False if pd.isna(ma200) else close < ma200
+
+    if above200 and ma20 > ma60 and (pd.isna(ret20) or ret20 >= 0):
+        return "Bull / Uptrend"
+    if below200 and ma20 < ma60 and (pd.isna(ret20) or ret20 <= 0):
+        return "Bear / Downtrend"
+    if ma20 > ma60 and (pd.isna(ma200) or close < ma200):
+        return "Recovery"
+    if ma20 < ma60 and (pd.isna(ma200) or close > ma200):
+        return "Distribution / Weakening"
+    return "Range / Neutral"
+
+
+def _classify_setup(row):
+    close = row.get("close")
+    ma20 = row.get("ma20")
+    ma60 = row.get("ma60")
+    ma200 = row.get("ma200")
+    high20 = row.get("high20")
+    low20 = row.get("low20")
+    ret5 = row.get("return_5d")
+    ret20 = row.get("return_20d")
+    vol_ratio = row.get("volume_vs_ma20", np.nan)
+
+    if pd.isna(close) or pd.isna(ma20) or pd.isna(ma60):
+        return "Unclassified"
+
+    near_high20 = pd.notna(high20) and close >= high20 * 0.98
+    near_low20 = pd.notna(low20) and close <= low20 * 1.05
+    volume_surge = pd.notna(vol_ratio) and vol_ratio >= 1.3
+    above200 = True if pd.isna(ma200) else close >= ma200
+    below200 = False if pd.isna(ma200) else close < ma200
+
+    if near_high20 and (pd.isna(ret20) or ret20 > 0.03):
+        return "Breakout" if volume_surge else "Breakout / Momentum"
+    if close >= ma60 and close <= ma20 * 1.03 and (pd.isna(ret20) or ret20 >= -0.03):
+        return "Pullback"
+    if near_low20 and pd.notna(ret5) and ret5 > 0.02:
+        return "Reversal"
+    if below200 and pd.notna(ret5) and ret5 > 0.03:
+        return "Counter-trend bounce"
+    if above200 and ma20 > ma60 and pd.notna(ret20) and ret20 > 0.05:
+        return "Trend following"
+    if pd.notna(ret20) and ret20 < -0.10:
+        return "Falling knife / Early reversal"
+    return "Range trade / Other"
+
+
+def _classify_entry_type(row):
+    close = row.get("close")
+    ma20 = row.get("ma20")
+    ma60 = row.get("ma60")
+    ma200 = row.get("ma200")
+    high20 = row.get("high20")
+    low20 = row.get("low20")
+    vol_ratio = row.get("volume_vs_ma20", np.nan)
+
+    tags = []
+    if pd.notna(high20) and close >= high20 * 0.98:
+        tags.append("near 20D high")
+    if pd.notna(low20) and close <= low20 * 1.05:
+        tags.append("near 20D low")
+    if pd.notna(ma20):
+        tags.append("above MA20" if close >= ma20 else "below MA20")
+    if pd.notna(ma60):
+        tags.append("above MA60" if close >= ma60 else "below MA60")
+    if pd.notna(ma200):
+        tags.append("above MA200" if close >= ma200 else "below MA200")
+    if pd.notna(vol_ratio) and vol_ratio >= 1.3:
+        tags.append("volume surge")
+    return ", ".join(tags[:4]) if tags else "Insufficient data"
+
+
+def _classification_confidence(row):
+    available = 0
+    for c in ["ma20", "ma60", "ma200", "high20", "low20", "return_5d", "return_20d", "volume_vs_ma20"]:
+        if c in row and pd.notna(row.get(c)):
+            available += 1
+    if available >= 7:
+        return "High"
+    if available >= 5:
+        return "Medium"
+    if available >= 3:
+        return "Low"
+    return "Very low"
+
+
+def auto_classify_trades(realized, prices):
+    """Attach auto_setup, auto_market_regime, and auto_entry_type to realized trades.
+
+    Classification is based on the nearest available price record on or before the BUY date.
+    Manual labels, if present in the trade file, can still be used separately.
+    """
+    if realized is None or realized.empty or prices is None or prices.empty:
+        out = realized.copy() if realized is not None else pd.DataFrame()
+        for c in ["auto_setup", "auto_market_regime", "auto_entry_type", "auto_confidence"]:
+            if not out.empty:
+                out[c] = "No price data"
+        return out
+
+    indicators = build_price_indicators(prices)
+    if indicators.empty:
+        return realized.copy()
+
+    rows = []
+    for _, trade in realized.iterrows():
+        out = trade.to_dict()
+        ticker = trade.get("ticker")
+        buy_date = trade.get("buy_date")
+        if pd.isna(buy_date):
+            out.update({
+                "auto_setup": "Unclassified",
+                "auto_market_regime": "Insufficient data",
+                "auto_entry_type": "Missing buy date",
+                "auto_confidence": "Very low",
+            })
+            rows.append(out)
+            continue
+
+        tp = indicators[(indicators["ticker"] == ticker) & (indicators["date"] <= buy_date)].sort_values("date")
+        if tp.empty:
+            out.update({
+                "auto_setup": "Unclassified",
+                "auto_market_regime": "Insufficient data",
+                "auto_entry_type": "No price before buy date",
+                "auto_confidence": "Very low",
+            })
+            rows.append(out)
+            continue
+
+        ctx = tp.iloc[-1].to_dict()
+        out.update({
+            "context_price_date": ctx.get("date"),
+            "context_close": ctx.get("close"),
+            "context_ma20": ctx.get("ma20"),
+            "context_ma60": ctx.get("ma60"),
+            "context_ma200": ctx.get("ma200"),
+            "context_return_5d": ctx.get("return_5d"),
+            "context_return_20d": ctx.get("return_20d"),
+            "context_return_60d": ctx.get("return_60d"),
+            "context_price_vs_ma20": ctx.get("price_vs_ma20"),
+            "context_price_vs_ma60": ctx.get("price_vs_ma60"),
+            "context_price_vs_ma200": ctx.get("price_vs_ma200"),
+            "context_volume_vs_ma20": ctx.get("volume_vs_ma20", np.nan),
+            "auto_market_regime": _classify_market_regime(ctx),
+            "auto_setup": _classify_setup(ctx),
+            "auto_entry_type": _classify_entry_type(ctx),
+            "auto_confidence": _classification_confidence(ctx),
+        })
         rows.append(out)
 
     return pd.DataFrame(rows)
@@ -780,6 +997,7 @@ else:
     st.success(f"Loaded price history for {prices['ticker'].nunique()} tickers.")
 
 analysis = enrich_with_exit_analysis(realized, prices, evaluation_days)
+analysis = auto_classify_trades(analysis, prices)
 metrics = compute_metrics(analysis)
 
 if not watchlist.empty:
@@ -817,11 +1035,12 @@ c8.metric("Avg recommended holding days", fmt_num(metrics.get("avg_recommended_h
 # Tabs
 # =========================================================
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
     "Actual vs Potential",
     "Stock detail",
     "Exit quality",
     "Performance metrics",
+    "Auto setup classification",
     "Market / Setup framework",
     "Market heatmap",
     "Watchlist",
@@ -1059,29 +1278,109 @@ with tab4:
         st.info("To unlock Setup × Regime Matrix, add `setup` plus `market_condition` or `market_regime` to your order history file.")
 
 with tab5:
+    st.subheader("Auto setup classification")
+    st.caption("Dashboard tự suy luận setup, market regime và entry type từ giá/MA/return/volume. Đây là rule-based classification, không phải AI black-box và không cần bạn nhập tay.")
+
+    auto_cols = [
+        "ticker", "buy_date", "sell_date", "actual_pnl", "actual_return", "holding_days",
+        "auto_setup", "auto_market_regime", "auto_entry_type", "auto_confidence",
+        "context_close", "context_ma20", "context_ma60", "context_ma200",
+        "context_return_5d", "context_return_20d", "context_price_vs_ma20", "context_price_vs_ma60", "context_price_vs_ma200", "context_volume_vs_ma20"
+    ]
+    auto_cols = [c for c in auto_cols if c in analysis.columns]
+
+    if prices.empty:
+        st.info("Auto classification cần price history. Hãy dùng Auto Yahoo Finance hoặc upload price_history.csv có cột date,ticker,close; có thêm volume thì càng tốt.")
+    elif not auto_cols:
+        st.info("Chưa có đủ dữ liệu để tự phân loại.")
+    else:
+        st.markdown("#### Classified trades")
+        auto_display = analysis[auto_cols].sort_values(["buy_date", "ticker"], ascending=[False, True])
+        non_numeric = [c for c in auto_display.columns if not pd.api.types.is_numeric_dtype(auto_display[c])]
+        render_heatmap_table(auto_display, exclude_cols=non_numeric)
+
+        valid_auto = analysis.dropna(subset=["actual_pnl"]).copy()
+        valid_auto["is_win"] = valid_auto["actual_pnl"] > 0
+
+        st.markdown("#### Performance by auto setup")
+        setup_perf = valid_auto.groupby("auto_setup", as_index=False).agg(
+            trades=("actual_pnl", "count"),
+            win_rate=("is_win", "mean"),
+            actual_pnl=("actual_pnl", "sum"),
+            avg_return=("actual_return", "mean"),
+            profit_factor=("actual_pnl", lambda s: s[s > 0].sum() / abs(s[s < 0].sum()) if abs(s[s < 0].sum()) > 0 else np.nan),
+            avg_holding_days=("holding_days", "mean"),
+        ).sort_values("actual_pnl", ascending=False)
+        render_heatmap_table(setup_perf, exclude_cols=["auto_setup"])
+
+        st.markdown("#### Performance by auto market regime")
+        regime_perf = valid_auto.groupby("auto_market_regime", as_index=False).agg(
+            trades=("actual_pnl", "count"),
+            win_rate=("is_win", "mean"),
+            actual_pnl=("actual_pnl", "sum"),
+            avg_return=("actual_return", "mean"),
+            profit_factor=("actual_pnl", lambda s: s[s > 0].sum() / abs(s[s < 0].sum()) if abs(s[s < 0].sum()) > 0 else np.nan),
+            avg_holding_days=("holding_days", "mean"),
+        ).sort_values("actual_pnl", ascending=False)
+        render_heatmap_table(regime_perf, exclude_cols=["auto_market_regime"])
+
+        st.markdown("#### Auto Setup × Auto Regime Matrix")
+        setup_regime_auto = valid_auto.groupby(["auto_setup", "auto_market_regime"], as_index=False).agg(
+            trades=("actual_pnl", "count"),
+            win_rate=("is_win", "mean"),
+            actual_pnl=("actual_pnl", "sum"),
+            avg_return=("actual_return", "mean"),
+            profit_factor=("actual_pnl", lambda s: s[s > 0].sum() / abs(s[s < 0].sum()) if abs(s[s < 0].sum()) > 0 else np.nan),
+            avg_holding_days=("holding_days", "mean"),
+        )
+        render_heatmap_table(setup_regime_auto, exclude_cols=["auto_setup", "auto_market_regime"])
+
+        matrix_metric = st.selectbox(
+            "Auto matrix metric",
+            ["win_rate", "actual_pnl", "avg_return", "profit_factor", "trades"],
+            key="auto_setup_regime_metric"
+        )
+        pivot_auto = setup_regime_auto.pivot(index="auto_setup", columns="auto_market_regime", values=matrix_metric)
+        st.dataframe(
+            pivot_auto.style.background_gradient(axis=None).format(format_decision_df(pivot_auto)),
+            use_container_width=True
+        )
+
+        csv_auto = analysis.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            label="Download trades with auto classification CSV",
+            data=csv_auto,
+            file_name="analyzed_trades_with_auto_setup_regime.csv",
+            mime="text/csv"
+        )
+
+with tab6:
     st.subheader("Market / Setup framework")
 
     st.markdown("""
-This dashboard is ready for the 4-level trading analysis framework:
+This dashboard now supports two ways to analyze setup and market condition:
 
-1. **Market Context**: trend/range, gap up/down, volume vs average, VN30/VNINDEX moving average.
-2. **Setup Analysis**: breakout, pullback, reversal, counter-trend, futures scalp.
-3. **Performance Metrics**: expectancy, profit factor, max drawdown, consecutive losses.
-4. **Exit Analysis**: actual vs potential P&L, capture rate, days to peak, missed profit.
+1. **Auto classification**: dashboard tự suy luận `auto_setup`, `auto_market_regime`, `auto_entry_type` từ price history.
+2. **Manual labels**: nếu sau này bạn muốn ghi chú sâu hơn, vẫn có thể thêm `setup`, `market_condition`, `entry_trigger`, `behavior_tag` vào file order history.
 
-Current file supports the strongest first layer:
+Auto classification rules are intentionally transparent:
+- **Breakout**: giá gần đỉnh 20 ngày, momentum dương, volume surge nếu có volume.
+- **Pullback**: giá còn trên MA60 nhưng điều chỉnh về gần MA20.
+- **Reversal**: giá gần đáy 20 ngày nhưng có hồi phục ngắn hạn.
+- **Counter-trend bounce**: giá dưới MA200 nhưng hồi mạnh ngắn hạn.
+- **Bull / Recovery / Bear / Range**: dựa trên vị trí giá so với MA20/60/200.
+
+Current file supports:
 - Actual vs Potential P&L
 - Days to peak after sale
 - Holding days vs recommended holding days
 - Capture rate
 - Win rate / expectancy / profit factor
-
-To unlock market-condition analysis, add optional columns:
-`setup`, `market_condition`, `entry_trigger`, `stop_loss`, `target`, `behavior_tag`.
+- Auto Setup × Auto Regime Matrix
+- Optional manual Setup × Regime Matrix
 """)
 
-
-with tab6:
+with tab7:
     st.subheader("Market heatmap: raw indicators, no composite score")
     st.caption("Upload `market_context.csv/xlsx` to track liquidity, valuation, earnings, FX, foreign flow, futures basis, or any market regime indicators. Numeric cells are colored directly from the actual value / percentile / trend.")
 
@@ -1115,7 +1414,7 @@ Rules are intentionally simple: lower percentile is green for valuation/risk col
                 fig_mkt = px.bar(chart_df, x=metric_col, y=selected_metric_value_col, title=f"{selected_metric_value_col} by market indicator")
                 st.plotly_chart(fig_mkt, use_container_width=True)
 
-with tab7:
+with tab8:
     st.subheader("Watchlist: stocks not yet bought")
     st.caption("This section is designed for candidates you are tracking but have not bought. It keeps actual raw metrics and uses heatmap coloring instead of scoring.")
 
@@ -1194,7 +1493,7 @@ The app will automatically add latest close, MA20/60/200, returns, price-vs-MA, 
             mime="text/csv"
         )
 
-with tab8:
+with tab9:
     st.subheader("Portfolio / Exposure")
     st.caption("Optional current holdings view. This does not replace the trade journal; it helps compare what you own vs what you are watching.")
 
@@ -1221,7 +1520,7 @@ Suggested format:
             fig_exp = px.pie(exposure, names="sector", values="market_value", title="Exposure by sector")
             st.plotly_chart(fig_exp, use_container_width=True)
 
-with tab9:
+with tab10:
     st.subheader("Raw standardized orders")
     st.dataframe(style_money_cols(trades), use_container_width=True)
 
