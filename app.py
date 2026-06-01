@@ -59,6 +59,141 @@ def style_money_cols(df):
                 out[c] = out[c].map(fmt_num)
     return out
 
+
+# =========================================================
+# Heatmap / decision-support helpers
+# =========================================================
+
+HEATMAP_COLORS = {
+    "very_positive": "background-color: #0f5132; color: white;",
+    "positive": "background-color: #d1e7dd; color: #0f5132;",
+    "neutral": "background-color: #fff3cd; color: #664d03;",
+    "negative": "background-color: #f8d7da; color: #842029;",
+    "very_negative": "background-color: #842029; color: white;",
+}
+
+HIGHER_IS_BETTER_HINTS = [
+    "growth", "roe", "roa", "margin", "liquidity", "value", "volume", "breadth",
+    "eps", "revenue", "profit", "cash", "net_buy", "foreign_buy", "above_ma",
+    "ma20_ma60", "price_vs_ma", "rsi", "momentum", "return", "upside", "yield"
+]
+LOWER_IS_BETTER_HINTS = [
+    "pe", "p/e", "pb", "p/b", "ps", "p/s", "ev_ebitda", "debt", "leverage",
+    "drawdown", "usd_vnd", "dxy", "foreign_sell", "risk", "volatility", "margin_pressure"
+]
+PERCENTILE_HINTS = ["percentile", "pctile", "rank_5y", "rank_3y"]
+
+
+def infer_direction(column_name):
+    cl = str(column_name).lower()
+    if any(k in cl for k in LOWER_IS_BETTER_HINTS):
+        return "lower_better"
+    if any(k in cl for k in HIGHER_IS_BETTER_HINTS):
+        return "higher_better"
+    return "higher_better"
+
+
+def status_from_value(value, column_name="", direction=None):
+    if pd.isna(value):
+        return ""
+    try:
+        v = float(value)
+    except Exception:
+        return ""
+
+    cl = str(column_name).lower()
+    direction = direction or infer_direction(column_name)
+
+    # Percentile columns are usually 0-1 or 0-100. For valuation/risk lower is better.
+    if any(k in cl for k in PERCENTILE_HINTS):
+        if abs(v) <= 1:
+            v = v * 100
+        lower_better = direction == "lower_better" or any(k in cl for k in LOWER_IS_BETTER_HINTS)
+        if lower_better:
+            if v <= 20: return "very_positive"
+            if v <= 40: return "positive"
+            if v <= 60: return "neutral"
+            if v <= 80: return "negative"
+            return "very_negative"
+        else:
+            if v >= 80: return "very_positive"
+            if v >= 60: return "positive"
+            if v >= 40: return "neutral"
+            if v >= 20: return "negative"
+            return "very_negative"
+
+    # Ratio columns around 1.0 such as MA20/MA60.
+    if "ma20_ma60" in cl or "ma20/ma60" in cl or "ratio" in cl:
+        if v >= 1.15: return "very_positive"
+        if v >= 1.03: return "positive"
+        if v >= 0.97: return "neutral"
+        if v >= 0.85: return "negative"
+        return "very_negative"
+
+    # Percentage-like values may be represented as decimals or whole percentages.
+    is_pct_like = any(k in cl for k in ["growth", "change", "return", "yield", "margin", "roe", "roa", "vs_ma", "pct", "%"])
+    if is_pct_like and abs(v) <= 1:
+        v = v * 100
+
+    if direction == "lower_better":
+        if v <= -10: return "very_positive"
+        if v <= 0: return "positive"
+        if v <= 10: return "neutral"
+        if v <= 25: return "negative"
+        return "very_negative"
+
+    if v >= 25: return "very_positive"
+    if v >= 5: return "positive"
+    if v >= -5: return "neutral"
+    if v >= -20: return "negative"
+    return "very_negative"
+
+
+def heatmap_style_numeric(df, exclude_cols=None, direction_overrides=None):
+    exclude_cols = set(exclude_cols or [])
+    direction_overrides = direction_overrides or {}
+
+    def style_cell(v, col):
+        if col in exclude_cols or not pd.api.types.is_numeric_dtype(df[col]):
+            return ""
+        status = status_from_value(v, col, direction_overrides.get(col))
+        return HEATMAP_COLORS.get(status, "")
+
+    styles = pd.DataFrame("", index=df.index, columns=df.columns)
+    for col in df.columns:
+        if col in exclude_cols or not pd.api.types.is_numeric_dtype(df[col]):
+            continue
+        styles[col] = df[col].map(lambda v, c=col: style_cell(v, c))
+    return styles
+
+
+def format_decision_df(df):
+    fmt = {}
+    for c in df.columns:
+        cl = str(c).lower()
+        if pd.api.types.is_numeric_dtype(df[c]):
+            if any(k in cl for k in ["pct", "percentile", "growth", "return", "margin", "roe", "roa", "yield", "vs_ma", "change", "rate"]):
+                fmt[c] = lambda x: "" if pd.isna(x) else (f"{x*100:.1f}%" if abs(float(x)) <= 1 else f"{float(x):.1f}%")
+            elif any(k in cl for k in ["price", "value", "volume", "liquidity", "margin_outstanding", "cash", "revenue", "profit"]):
+                fmt[c] = lambda x: "" if pd.isna(x) else f"{float(x):,.0f}".replace(",", ".")
+            else:
+                fmt[c] = lambda x: "" if pd.isna(x) else f"{float(x):,.2f}".rstrip("0").rstrip(".")
+    return fmt
+
+
+def render_heatmap_table(df, caption=None, exclude_cols=None, direction_overrides=None):
+    if df is None or df.empty:
+        st.info("No data to display.")
+        return
+    if caption:
+        st.caption(caption)
+    styled = df.style.apply(
+        lambda x: heatmap_style_numeric(df, exclude_cols=exclude_cols, direction_overrides=direction_overrides),
+        axis=None
+    ).format(format_decision_df(df))
+    st.dataframe(styled, use_container_width=True)
+
+
 # =========================================================
 # Input normalization
 # =========================================================
@@ -253,6 +388,150 @@ def normalize_price_history(df):
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
     return df.dropna(subset=["date", "ticker", "close"]).sort_values(["ticker", "date"])
 
+
+def normalize_flexible_table(df, ticker_required=False, date_col_optional=True):
+    """Normalize optional CSV/XLSX inputs while preserving user-defined columns.
+
+    Useful for:
+    - market_context.csv: metric-level or date-level market indicators
+    - watchlist.csv: stock candidates not yet bought
+    - portfolio.csv: current holdings, if user wants to upload it later
+    """
+    df = df.copy()
+    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
+
+    if ticker_required and "ticker" not in df.columns:
+        st.error("File này cần có cột `ticker`.")
+        st.stop()
+
+    if "ticker" in df.columns:
+        df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
+
+    for c in df.columns:
+        cl = c.lower()
+        if cl in ["date", "as_of_date", "report_date"]:
+            df[c] = pd.to_datetime(df[c], errors="coerce")
+            continue
+        if c not in ["ticker", "sector", "industry", "note", "status", "cycle", "trigger", "reason", "watch_reason"]:
+            converted = pd.to_numeric(df[c], errors="ignore")
+            df[c] = converted
+    return df
+
+
+def latest_price_snapshot(prices):
+    if prices is None or prices.empty:
+        return pd.DataFrame()
+    p = prices.sort_values(["ticker", "date"]).copy()
+    p["ma20"] = p.groupby("ticker")["close"].transform(lambda s: s.rolling(20, min_periods=5).mean())
+    p["ma60"] = p.groupby("ticker")["close"].transform(lambda s: s.rolling(60, min_periods=20).mean())
+    p["ma200"] = p.groupby("ticker")["close"].transform(lambda s: s.rolling(200, min_periods=60).mean())
+    p["return_20d"] = p.groupby("ticker")["close"].pct_change(20)
+    p["return_60d"] = p.groupby("ticker")["close"].pct_change(60)
+    p["price_vs_ma20"] = p["close"] / p["ma20"] - 1
+    p["price_vs_ma60"] = p["close"] / p["ma60"] - 1
+    p["price_vs_ma200"] = p["close"] / p["ma200"] - 1
+    snap = p.groupby("ticker", as_index=False).tail(1)
+    return snap[["ticker", "date", "close", "ma20", "ma60", "ma200", "return_20d", "return_60d", "price_vs_ma20", "price_vs_ma60", "price_vs_ma200"]]
+
+
+def build_watchlist_view(watchlist, prices):
+    if watchlist is None or watchlist.empty:
+        return pd.DataFrame()
+    out = watchlist.copy()
+    snap = latest_price_snapshot(prices)
+    if not snap.empty:
+        out = out.merge(snap, on="ticker", how="left", suffixes=("", "_market"))
+
+    if "target_price" in out.columns and "close" in out.columns:
+        out["upside_to_target"] = out["target_price"] / out["close"] - 1
+    if "fair_value" in out.columns and "close" in out.columns:
+        out["upside_to_fair_value"] = out["fair_value"] / out["close"] - 1
+
+    trigger_cols = [c for c in out.columns if c.startswith("trigger_")]
+    if trigger_cols:
+        def readiness(row):
+            vals = []
+            for c in trigger_cols:
+                v = row.get(c)
+                if isinstance(v, str):
+                    vals.append(v.strip().lower() in ["yes", "y", "true", "1", "done", "pass", "ready", "đạt"])
+                else:
+                    vals.append(bool(v) if not pd.isna(v) else False)
+            return f"{sum(vals)}/{len(vals)}"
+        out["trigger_readiness"] = out.apply(readiness, axis=1)
+    return out
+
+
+def build_missed_opportunity_view(watchlist, prices):
+    """Track stocks that were watched but not bought from their added_date.
+
+    Required/optional watchlist columns:
+    - ticker: required
+    - added_date / watch_date: optional. If absent, the first available price date is used.
+    - intended_capital: optional. Used to estimate missed opportunity value.
+    - reason_not_bought / watch_reason / note: optional qualitative tags.
+    """
+    if watchlist is None or watchlist.empty or prices is None or prices.empty:
+        return pd.DataFrame()
+
+    date_col = None
+    for c in ["added_date", "watch_date", "start_date", "candidate_date"]:
+        if c in watchlist.columns:
+            date_col = c
+            break
+
+    rows = []
+    price_df = prices.sort_values(["ticker", "date"]).copy()
+    for _, row in watchlist.iterrows():
+        ticker = row.get("ticker")
+        tp = price_df[price_df["ticker"] == ticker].copy()
+        if tp.empty:
+            continue
+
+        added_date = pd.to_datetime(row.get(date_col), errors="coerce") if date_col else pd.NaT
+        if pd.isna(added_date):
+            added_date = tp["date"].min()
+
+        after = tp[tp["date"] >= added_date].sort_values("date")
+        if after.empty:
+            continue
+
+        start = after.iloc[0]
+        latest = after.iloc[-1]
+        peak = after.loc[after["close"].idxmax()]
+        trough = after.loc[after["close"].idxmin()]
+
+        current_return = latest["close"] / start["close"] - 1 if start["close"] else np.nan
+        max_return = peak["close"] / start["close"] - 1 if start["close"] else np.nan
+        max_drawdown_from_watch = trough["close"] / start["close"] - 1 if start["close"] else np.nan
+
+        intended_capital = row.get("intended_capital", np.nan)
+        try:
+            intended_capital = float(intended_capital)
+        except Exception:
+            intended_capital = np.nan
+
+        out = {
+            "ticker": ticker,
+            "added_date": added_date,
+            "start_price": start["close"],
+            "latest_date": latest["date"],
+            "latest_price": latest["close"],
+            "current_return_since_added": current_return,
+            "peak_price_since_added": peak["close"],
+            "peak_date_since_added": peak["date"],
+            "max_return_since_added": max_return,
+            "max_drawdown_since_added": max_drawdown_from_watch,
+            "missed_profit_est": intended_capital * current_return if pd.notna(intended_capital) and pd.notna(current_return) else np.nan,
+        }
+        for c in ["sector", "industry", "cycle", "reason_not_bought", "watch_reason", "note"]:
+            if c in watchlist.columns:
+                out[c] = row.get(c)
+        rows.append(out)
+
+    return pd.DataFrame(rows)
+
+
 def enrich_with_exit_analysis(realized, prices, evaluation_days):
     if realized.empty:
         return realized
@@ -416,6 +695,24 @@ with st.sidebar:
     st.caption("These are not required. Add these columns later if you want deeper analysis.")
     st.code("setup,market_condition,entry_trigger,stop_loss,target,behavior_tag", language="text")
 
+    st.header("Optional decision-support files")
+    st.caption("Add raw indicators. The dashboard will show the real numbers and color them as a heatmap; no black-box scores.")
+    market_context_file = st.file_uploader(
+        "Upload market_context.csv/xlsx",
+        type=["csv", "xlsx", "xls"],
+        help="Suggested columns: metric,current,3m_ago,yoy,percentile_5y,trend,note. You can also use date-level rows."
+    )
+    watchlist_file = st.file_uploader(
+        "Upload watchlist.csv/xlsx",
+        type=["csv", "xlsx", "xls"],
+        help="Required column: ticker. Optional: sector, pe, pb, roe, eps_growth_yoy, revenue_growth_yoy, target_price, fair_value, trigger_* columns."
+    )
+    portfolio_file = st.file_uploader(
+        "Upload current_portfolio.csv/xlsx",
+        type=["csv", "xlsx", "xls"],
+        help="Optional. Suggested columns: ticker, quantity, avg_price, market_value, sector."
+    )
+
 if trades_file is None:
     st.info("Upload `cleaned_order_history_dashboard_format.csv` to start.")
     st.stop()
@@ -431,13 +728,44 @@ if realized.empty:
     st.warning("No realized sell trades found. Need BUY and SELL rows to compute actual P&L.")
     st.stop()
 
-min_date = trades["date"].min() - timedelta(days=10)
+market_context = pd.DataFrame()
+watchlist = pd.DataFrame()
+portfolio = pd.DataFrame()
+watchlist_view = pd.DataFrame()
+missed_watchlist = pd.DataFrame()
+
+# Read optional files before fetching prices so the price loader includes
+# tickers that are not in historical trades yet, especially watchlist names.
+if market_context_file is not None:
+    market_context = normalize_flexible_table(read_uploaded_file(market_context_file), ticker_required=False)
+
+if watchlist_file is not None:
+    watchlist = normalize_flexible_table(read_uploaded_file(watchlist_file), ticker_required=True)
+
+if portfolio_file is not None:
+    portfolio = normalize_flexible_table(read_uploaded_file(portfolio_file), ticker_required=True)
+
+all_tickers = set(trades["ticker"].dropna().unique())
+if not watchlist.empty and "ticker" in watchlist.columns:
+    all_tickers.update(watchlist["ticker"].dropna().unique())
+if not portfolio.empty and "ticker" in portfolio.columns:
+    all_tickers.update(portfolio["ticker"].dropna().unique())
+tickers = sorted(all_tickers)
+
+min_date_candidates = [trades["date"].min() - timedelta(days=10)]
+for df_optional in [watchlist, portfolio]:
+    for dc in ["added_date", "watch_date", "start_date", "candidate_date", "as_of_date", "date"]:
+        if not df_optional.empty and dc in df_optional.columns:
+            dmin = pd.to_datetime(df_optional[dc], errors="coerce").min()
+            if pd.notna(dmin):
+                min_date_candidates.append(dmin - timedelta(days=10))
+
+min_date = min(min_date_candidates)
 max_date = trades["date"].max() + timedelta(days=evaluation_days + 10)
-tickers = sorted(trades["ticker"].dropna().unique())
 
 prices = pd.DataFrame()
 if price_mode == "Auto Yahoo Finance":
-    with st.spinner("Fetching historical prices from Yahoo Finance..."):
+    with st.spinner("Fetching historical prices for trades + watchlist + portfolio from Yahoo Finance..."):
         prices = fetch_yahoo_prices(tickers, min_date, max_date)
 else:
     if price_file is None:
@@ -453,6 +781,19 @@ else:
 
 analysis = enrich_with_exit_analysis(realized, prices, evaluation_days)
 metrics = compute_metrics(analysis)
+
+if not watchlist.empty:
+    watchlist_view = build_watchlist_view(watchlist, prices)
+    missed_watchlist = build_missed_opportunity_view(watchlist, prices)
+
+if not portfolio.empty:
+    snap = latest_price_snapshot(prices)
+    if not snap.empty:
+        portfolio = portfolio.merge(snap, on="ticker", how="left", suffixes=("", "_market"))
+    if "quantity" in portfolio.columns and "avg_price" in portfolio.columns and "close" in portfolio.columns:
+        portfolio["market_value_est"] = portfolio["quantity"] * portfolio["close"]
+        portfolio["unrealized_pnl_est"] = (portfolio["close"] - portfolio["avg_price"]) * portfolio["quantity"]
+        portfolio["unrealized_return_est"] = portfolio["close"] / portfolio["avg_price"] - 1
 
 # =========================================================
 # Top metrics
@@ -476,12 +817,15 @@ c8.metric("Avg recommended holding days", fmt_num(metrics.get("avg_recommended_h
 # Tabs
 # =========================================================
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     "Actual vs Potential",
     "Stock detail",
     "Exit quality",
     "Performance metrics",
     "Market / Setup framework",
+    "Market heatmap",
+    "Watchlist",
+    "Portfolio / Exposure",
     "Raw data"
 ])
 
@@ -669,6 +1013,51 @@ with tab4:
     else:
         st.info("For setup/market-condition analysis, add columns like `setup`, `market_condition`, `entry_trigger`, `behavior_tag` to your trade file later.")
 
+    st.markdown("#### Setup × Regime Matrix")
+    st.caption("Shows which setups work better under each market condition/regime, using actual raw performance metrics rather than a score.")
+    setup_col = "setup" if "setup" in trades.columns else None
+    regime_col = None
+    for c in ["market_regime", "market_condition", "regime"]:
+        if c in trades.columns:
+            regime_col = c
+            break
+
+    if setup_col and regime_col:
+        label_cols = ["ticker", "date", setup_col, regime_col]
+        sell_labels = trades[trades["side"] == "SELL"][label_cols].dropna(subset=[setup_col, regime_col])
+        matrix_src = valid.merge(sell_labels, left_on=["ticker", "sell_date"], right_on=["ticker", "date"], how="left")
+        matrix_src = matrix_src.dropna(subset=[setup_col, regime_col])
+
+        if matrix_src.empty:
+            st.info("No matched setup/regime labels found on SELL rows yet.")
+        else:
+            setup_regime = matrix_src.groupby([setup_col, regime_col], as_index=False).agg(
+                trades=("actual_pnl", "count"),
+                win_rate=("is_win", "mean"),
+                actual_pnl=("actual_pnl", "sum"),
+                avg_return=("actual_return", "mean"),
+                profit_factor=("actual_pnl", lambda s: s[s > 0].sum() / abs(s[s < 0].sum()) if abs(s[s < 0].sum()) > 0 else np.nan),
+                avg_holding_days=("holding_days", "mean"),
+            )
+            render_heatmap_table(
+                setup_regime,
+                caption="Green/red is applied directly to win rate, P&L, return, profit factor, and holding metrics.",
+                exclude_cols=[setup_col, regime_col],
+            )
+
+            pivot_metric = st.selectbox(
+                "Matrix metric",
+                ["win_rate", "actual_pnl", "avg_return", "profit_factor", "trades"],
+                key="setup_regime_metric"
+            )
+            pivot = setup_regime.pivot(index=setup_col, columns=regime_col, values=pivot_metric)
+            st.dataframe(
+                pivot.style.background_gradient(axis=None).format(format_decision_df(pivot)),
+                use_container_width=True
+            )
+    else:
+        st.info("To unlock Setup × Regime Matrix, add `setup` plus `market_condition` or `market_regime` to your order history file.")
+
 with tab5:
     st.subheader("Market / Setup framework")
 
@@ -691,7 +1080,148 @@ To unlock market-condition analysis, add optional columns:
 `setup`, `market_condition`, `entry_trigger`, `stop_loss`, `target`, `behavior_tag`.
 """)
 
+
 with tab6:
+    st.subheader("Market heatmap: raw indicators, no composite score")
+    st.caption("Upload `market_context.csv/xlsx` to track liquidity, valuation, earnings, FX, foreign flow, futures basis, or any market regime indicators. Numeric cells are colored directly from the actual value / percentile / trend.")
+
+    if market_context.empty:
+        st.info("No market context file uploaded yet.")
+        st.markdown("""
+Suggested format:
+
+| metric | current | 3m_ago | yoy | percentile_5y | trend | note |
+|---|---:|---:|---:|---:|---|---|
+| hose_value_bn | 28500 | 22100 | 0.32 | 0.78 | up | Liquidity improving |
+| vnindex_pe | 12.8 | 11.9 | -0.05 | 0.22 | neutral | Valuation still reasonable |
+| usd_vnd_change_1m | 0.012 | 0.008 | 0.03 | 0.65 | up | FX pressure rising |
+
+Rules are intentionally simple: lower percentile is green for valuation/risk columns; higher growth/liquidity/breadth columns are green.
+""")
+    else:
+        non_numeric = [c for c in market_context.columns if not pd.api.types.is_numeric_dtype(market_context[c])]
+        render_heatmap_table(
+            market_context,
+            caption="Heatmap is applied only to numeric columns. Text columns such as metric/trend/note remain unchanged.",
+            exclude_cols=non_numeric,
+        )
+
+        numeric_cols = [c for c in market_context.columns if pd.api.types.is_numeric_dtype(market_context[c])]
+        metric_col = "metric" if "metric" in market_context.columns else None
+        if metric_col and numeric_cols:
+            selected_metric_value_col = st.selectbox("Chart market metric column", numeric_cols, key="market_metric_col")
+            chart_df = market_context[[metric_col, selected_metric_value_col]].dropna().copy()
+            if not chart_df.empty:
+                fig_mkt = px.bar(chart_df, x=metric_col, y=selected_metric_value_col, title=f"{selected_metric_value_col} by market indicator")
+                st.plotly_chart(fig_mkt, use_container_width=True)
+
+with tab7:
+    st.subheader("Watchlist: stocks not yet bought")
+    st.caption("This section is designed for candidates you are tracking but have not bought. It keeps actual raw metrics and uses heatmap coloring instead of scoring.")
+
+    if watchlist_view.empty:
+        st.info("No watchlist file uploaded yet.")
+        st.markdown("""
+Suggested format:
+
+| ticker | sector | pe | pb | roe | eps_growth_yoy | revenue_growth_yoy | target_price | fair_value | trigger_breakout_ma200 | trigger_eps_recovery | note |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| HPG | Steel | 10.5 | 1.4 | 0.18 | 0.45 | 0.28 | 36000 | 34000 | yes | yes | Early recovery candidate |
+| FPT | Tech | 22.0 | 5.1 | 0.24 | 0.21 | 0.18 | 145000 | 140000 | no | yes | Quality compounder |
+
+The app will automatically add latest close, MA20/60/200, returns, price-vs-MA, and upside columns when price history is available.
+""")
+    else:
+        display_cols = list(watchlist_view.columns)
+        preferred = [
+            "ticker", "sector", "industry", "cycle", "close", "target_price", "fair_value",
+            "upside_to_target", "upside_to_fair_value", "pe", "pb", "roe",
+            "eps_growth_yoy", "revenue_growth_yoy", "return_20d", "return_60d",
+            "price_vs_ma20", "price_vs_ma60", "price_vs_ma200", "trigger_readiness", "note"
+        ]
+        ordered = [c for c in preferred if c in display_cols] + [c for c in display_cols if c not in preferred]
+        wl_display = watchlist_view[ordered]
+        non_numeric = [c for c in wl_display.columns if not pd.api.types.is_numeric_dtype(wl_display[c])]
+        render_heatmap_table(wl_display, exclude_cols=non_numeric)
+
+        if "sector" in watchlist_view.columns:
+            st.markdown("#### Watchlist sector count")
+            sector_count = watchlist_view.groupby("sector", as_index=False).agg(stocks=("ticker", "count"))
+            fig_sector = px.bar(sector_count, x="sector", y="stocks", title="Number of candidates by sector")
+            st.plotly_chart(fig_sector, use_container_width=True)
+
+        if "upside_to_target" in watchlist_view.columns:
+            st.markdown("#### Upside to target")
+            top_upside = watchlist_view.dropna(subset=["upside_to_target"]).sort_values("upside_to_target", ascending=False).head(20)
+            if not top_upside.empty:
+                fig_up = px.bar(top_upside, x="ticker", y="upside_to_target", title="Watchlist upside to target")
+                fig_up.update_yaxes(tickformat=".0%")
+                st.plotly_chart(fig_up, use_container_width=True)
+
+        st.markdown("#### Missed Opportunity Tracker")
+        st.caption("Tracks candidates from `added_date` / `watch_date` until the latest available price. Add `intended_capital` to estimate missed profit in VND.")
+        if missed_watchlist.empty:
+            st.info("To activate this, add `added_date` or `watch_date` to watchlist.csv and make sure price history covers those tickers.")
+        else:
+            missed_cols = list(missed_watchlist.columns)
+            preferred_missed = [
+                "ticker", "sector", "cycle", "added_date", "start_price", "latest_price",
+                "current_return_since_added", "peak_price_since_added", "max_return_since_added",
+                "max_drawdown_since_added", "missed_profit_est", "reason_not_bought", "watch_reason", "note"
+            ]
+            missed_ordered = [c for c in preferred_missed if c in missed_cols] + [c for c in missed_cols if c not in preferred_missed]
+            missed_display = missed_watchlist[missed_ordered].sort_values("current_return_since_added", ascending=False)
+            non_numeric_missed = [c for c in missed_display.columns if not pd.api.types.is_numeric_dtype(missed_display[c])]
+            render_heatmap_table(missed_display, exclude_cols=non_numeric_missed)
+
+            if "current_return_since_added" in missed_watchlist.columns:
+                top_missed_chart = missed_watchlist.dropna(subset=["current_return_since_added"]).sort_values("current_return_since_added", ascending=False).head(20)
+                if not top_missed_chart.empty:
+                    fig_missed = px.bar(
+                        top_missed_chart,
+                        x="ticker",
+                        y="current_return_since_added",
+                        title="Watchlist return since added / watched"
+                    )
+                    fig_missed.update_yaxes(tickformat=".0%")
+                    st.plotly_chart(fig_missed, use_container_width=True)
+
+        csv_wl = watchlist_view.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            label="Download enriched watchlist CSV",
+            data=csv_wl,
+            file_name="enriched_watchlist_heatmap.csv",
+            mime="text/csv"
+        )
+
+with tab8:
+    st.subheader("Portfolio / Exposure")
+    st.caption("Optional current holdings view. This does not replace the trade journal; it helps compare what you own vs what you are watching.")
+
+    if portfolio.empty:
+        st.info("No current portfolio file uploaded yet.")
+        st.markdown("""
+Suggested format:
+
+| ticker | quantity | avg_price | sector | note |
+|---|---:|---:|---|---|
+| FPT | 100 | 120000 | Tech | Core position |
+| HPG | 1000 | 28000 | Steel | Cyclical recovery |
+""")
+    else:
+        non_numeric = [c for c in portfolio.columns if not pd.api.types.is_numeric_dtype(portfolio[c])]
+        render_heatmap_table(portfolio, exclude_cols=non_numeric)
+
+        if "sector" in portfolio.columns and "market_value_est" in portfolio.columns:
+            exposure = portfolio.groupby("sector", as_index=False).agg(market_value_est=("market_value_est", "sum"))
+            fig_exp = px.pie(exposure, names="sector", values="market_value_est", title="Estimated exposure by sector")
+            st.plotly_chart(fig_exp, use_container_width=True)
+        elif "market_value" in portfolio.columns and "sector" in portfolio.columns:
+            exposure = portfolio.groupby("sector", as_index=False).agg(market_value=("market_value", "sum"))
+            fig_exp = px.pie(exposure, names="sector", values="market_value", title="Exposure by sector")
+            st.plotly_chart(fig_exp, use_container_width=True)
+
+with tab9:
     st.subheader("Raw standardized orders")
     st.dataframe(style_money_cols(trades), use_container_width=True)
 
